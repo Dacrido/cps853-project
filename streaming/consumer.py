@@ -104,7 +104,7 @@ for message in consumer:
     # Only every 20 seconds
     now = time.monotonic()
     if now - last_update >= UPDATE_INTERVAL:        
-        print(f"Clean rows: {len(clean)}:,", flush=True)
+        print(f"Clean rows: {len(clean):,}", flush=True)
         print(f"Bad rows: {len(quarantine):,} : ", flush=True)
         last_update = now
 
