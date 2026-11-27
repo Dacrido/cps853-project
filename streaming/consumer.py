@@ -16,11 +16,14 @@ from datetime import datetime
 from collections import Counter
 
 from kafka import KafkaConsumer
+from serve.db import connect
+from serve.load_db import load_stream
 
 TOPIC = "power-usage"
 BROKER = "kafka:9092" # 9092 is typical for apache kafka. kafka as runs inside docker
 GROUP_ID = "power-usage-consumer" # group id for consumers. There is only one
 UPDATE_INTERVAL = 20
+BATCH_SIZE = 1000
 
 TS_FORMAT = "%d/%m/%Y %H:%M:%S"
 
@@ -75,8 +78,12 @@ def problems(key, row, seen_keys):
 
     return issues
 
+total_clean = 0
+total_quarantine = 0
+reason_counts = Counter()
 clean = []
 quarantine = []
+conn = connect()
 
 last_update = time.monotonic()
 
@@ -93,30 +100,47 @@ for message in consumer:
     issues = problems(key, row, seen_keys)
 
     if not issues:
-        clean.append(row)
+        clean_row = {
+            "ts": datetime.strptime(row["ts"], TS_FORMAT),
+            **{
+                clean_name: row.get(raw_name)
+                for raw_name, clean_name in MEASURES.items()
+            }
+        }
+        clean.append(clean_row)
+        total_clean += 1
     else:
-        quarantine.append({
-            "key" : key.decode("utf-8", errors="replace"),
-            "row" : row,
-            "reasons" : issues
-        })
+        quarantine.append((
+            datetime.strptime(row["ts"], TS_FORMAT),
+            json.dumps(row),
+            "duplicate" in issues,
+            "late" in issues,
+            "all_measurements_missing" in issues
+        ))
+        total_quarantine +=1
+        reason_counts.update(issues)
+
+    if len(clean) + len(quarantine) >= BATCH_SIZE:
+        load_stream(conn, clean, quarantine)
+        clean.clear()
+        quarantine.clear()
 
     # Only every 20 seconds
     now = time.monotonic()
     if now - last_update >= UPDATE_INTERVAL:        
-        print(f"Clean rows: {len(clean):,}", flush=True)
-        print(f"Bad rows: {len(quarantine):,} : ", flush=True)
+        print(f"Clean rows: {total_clean:,}", flush=True)
+        print(f"Bad rows: {total_quarantine:,} ", flush=True)
         last_update = now
 
+if clean or quarantine:
+        load_stream(conn, clean, quarantine)
+
+conn.close()
 consumer.close()
 
 print("\n=== Consumer summary ===")
-print(f"Clean rows: {len(clean)}:,")
-print(f"Bad rows: {len(quarantine):,} : ")
-reason_counts = Counter(
-    reason
-    for row in quarantine
-    for reason in row["reasons"]
-)
+print(f"Clean rows: {total_clean:,}")
+print(f"Bad rows: {total_quarantine:,} : ")
+
 for reason, count in reason_counts.items():
     print(f"{reason}: {count:,}")

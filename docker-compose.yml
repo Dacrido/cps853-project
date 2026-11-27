@@ -45,6 +45,9 @@ services:
         "2g",
         "jobs/ingest.py",
       ]
+    depends_on:
+      postgres:
+          condition: service_started
 
   # Answers Q1-Q3 from Parquet. Saves results to data/results/. Runs after ingest finishes.
   batch-queries:
@@ -96,17 +99,28 @@ services:
     depends_on:
       kafka:
         condition: service_started
+      postgres:
+        condition: service_started
 
   consumer:
     <<: *spark
+    environment:
+      PYTHONPATH: /work
+      PGHOST: postgres
+      PGPORT: 5432
+      PGDATABASE: power
+      PGUSER: power
+      PGPASSWORD: power
     command:
       [
         "sh",
         "-c",
-        "pip install --no-cache-dir kafka-python && python3 streaming/consumer.py",
+        "pip install --no-cache-dir kafka-python psycopg[binary] pyarrow && python3 streaming/consumer.py",
       ]
     depends_on:
       kafka:
+        condition: service_started
+      postgres:
         condition: service_started
 
   # ---------- Part 3: Serve (Sachman) ----------
@@ -121,36 +135,38 @@ services:
       POSTGRES_PASSWORD: power
     ports:
       - "5433:5432" # 5433 on the laptop, in case a local PostgreSQL already uses 5432
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-      - ./serve/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
     healthcheck:
-      # Over TCP: during first-time setup (schema.sql) Postgres only listens on a local socket,
-      # so this passes only once the tables exist and the real server is up.
-      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U power -d power"]
+      test: ["CMD-SHELL", "pg_isready -U power -d power"]
       interval: 2s
       timeout: 5s
       retries: 30
 
-  # Loads data/results/ (batch answers) and data/quarantine/ingest into PostgreSQL.
-  load-batch:
+  # Initialize all PostgreSQL tables.
+  # Runs after PostgreSQL is ready and before any data is loaded.
+  init-db:
     <<: *python
-    command: ["python", "-m", "serve.load_batch"]
+    command: ["python", "-m", "serve.init_db"]
     depends_on:
-      batch-queries:
-        condition: service_completed_successfully
       postgres:
         condition: service_healthy
 
-  # Answers Q1-Q3 from PostgreSQL and times each answer, once the stream has finished.
-  # Run it again at any time (even mid-stream):   docker compose run --rm --no-deps serve-queries
+   # Load Spark batch results and ingest quarantine into PostgreSQL.
+  load-batch:
+    <<: *python
+    command: ["python", "-m", "serve.load_db"]
+    depends_on:
+      init-db:
+        condition: service_completed_successfully
+      batch-queries:
+        condition: service_completed_successfully
+
+  # Answers Q1-Q3 using PostgreSQL.
+  # Waits until both batch loading and streaming have finished.
   serve-queries:
     <<: *python
     command: ["python", "-m", "serve.queries"]
     depends_on:
       load-batch:
-        condition: service_completed_successfully
-      consumer:
         condition: service_completed_successfully
 
   # ---------- Part 4: Quality and monitoring (All) ----------
@@ -158,18 +174,18 @@ services:
 
   # Rows in and out at every stage, rows failed per check, alerts, and the rows set aside.
   # Run it again at any time (even mid-stream):   docker compose run --rm --no-deps quality-report
-  quality-report:
-    <<: *python
-    command: ["python", "-m", "quality.report"]
-    depends_on:
-      serve-queries:
-        condition: service_completed_successfully
+#   quality-report:
+#     <<: *python
+#     command: ["python", "-m", "quality.report"]
+#     depends_on:
+#       serve-queries:
+#         condition: service_completed_successfully
 
-  # Part 4 experiment only (not started by docker compose up): see quality/run_experiment.sh.
-  quality-measure:
-    <<: *python
-    command: ["python", "-m", "quality.measure"]
-    profiles: ["experiment"]
+#   # Part 4 experiment only (not started by docker compose up): see quality/run_experiment.sh.
+#   quality-measure:
+#     <<: *python
+#     command: ["python", "-m", "quality.measure"]
+#     profiles: ["experiment"]
 
-volumes:
-  pgdata: # the database's files; removed by   docker compose down -v
+# volumes:
+#   pgdata: # the database's files; removed by   docker compose down -v
